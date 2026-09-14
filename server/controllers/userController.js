@@ -333,7 +333,10 @@ const getTechnicianUsers = asyncHandler(async (req, res) => {
     .filter(t => t.isActive !== false && t.role && t.role.toLowerCase() === 'technician')
     .map(t => {
       const { password, ...safeTech } = t;
-      return safeTech;
+      return {
+        ...safeTech,
+        name: safeTech.name || safeTech.displayName || (safeTech.email ? safeTech.email.split('@')[0] : 'Technician'),
+      };
     });
 
   res.status(200).json(technicians);

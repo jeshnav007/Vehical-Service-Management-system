@@ -1,5 +1,6 @@
 const admin = (req, res, next) => {
-  if (req.user && req.user.role === 'Admin') {
+  const role = req.user?.role?.toLowerCase();
+  if (role === 'admin') {
     next();
   } else {
     res.status(403).json({ message: 'Not authorized as admin' });
@@ -7,7 +8,8 @@ const admin = (req, res, next) => {
 };
 
 const serviceCenter = (req, res, next) => {
-  if (req.user && (req.user.role === 'ServiceCenter' || req.user.role === 'Admin')) {
+  const role = req.user?.role?.toLowerCase();
+  if (role === 'servicecenter' || role === 'admin') {
     next();
   } else {
     res.status(403).json({ message: 'Not authorized as service center' });
@@ -15,7 +17,8 @@ const serviceCenter = (req, res, next) => {
 };
 
 const technician = (req, res, next) => {
-  if (req.user && req.user.role === 'Technician') {
+  const role = req.user?.role?.toLowerCase();
+  if (role === 'technician' || role === 'admin') {
     next();
   } else {
     res.status(403).json({ message: 'Not authorized as technician' });

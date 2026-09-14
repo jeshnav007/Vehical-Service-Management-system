@@ -5,9 +5,9 @@ import { toast } from 'react-hot-toast';
 import { createServiceRecord } from '../redux/slices/serviceRecordSlice';
 import { createInvoice, getInvoices } from '../redux/slices/invoiceSlice';
 import axiosInstance from '../services/axiosInstance';
-import { SERVICES_URL, STATUS } from '../utils/constants';
+import { USERS_URL, SERVICES_URL, STATUS } from '../utils/constants';
 import { db } from '../config/firebase';
-import { collection, getDocs, query, where } from 'firebase/firestore';
+import { collection, getDocs } from 'firebase/firestore';
 import Card from '../components/common/Card';
 import StatusBadge from '../components/common/StatusBadge';
 import Loader from '../components/common/Loader';
@@ -48,22 +48,31 @@ const ServiceCenterDashboard = () => {
     dispatch(getInvoices());
     fetchServiceRecords();
 
-    // Fetch technicians directly from Firestore — no backend hop needed.
-    // Firestore rules allow any authenticated user to read the users collection.
     const fetchTechnicians = async () => {
+      // 1. Try Backend API endpoint
       try {
-        const q = query(
-          collection(db, 'users'),
-          where('role', '==', 'Technician')
-        );
-        const snapshot = await getDocs(q);
+        const { data } = await axiosInstance.get(`${USERS_URL}/technicians`);
+        if (Array.isArray(data) && data.length > 0) {
+          setTechnicians(data);
+          return;
+        }
+      } catch (backendError) {
+        console.warn('Backend /api/users/technicians failed, attempting client fallback:', backendError?.message || backendError);
+      }
+
+      // 2. Direct Firestore fallback (case-insensitive)
+      try {
+        const snapshot = await getDocs(collection(db, 'users'));
         const techs = snapshot.docs
           .map(doc => ({ _id: doc.id, id: doc.id, ...doc.data() }))
-          .filter(t => t.isActive !== false);
+          .filter(t => t.isActive !== false && t.role && t.role.toLowerCase() === 'technician')
+          .map(t => ({
+            ...t,
+            name: t.name || t.displayName || (t.email ? t.email.split('@')[0] : 'Technician'),
+          }));
         setTechnicians(techs);
       } catch (error) {
-        console.error('Failed to fetch technicians:', error.message);
-        toast.error('Could not load technician list. Please refresh.');
+        console.error('Failed to fetch technicians from Firestore:', error?.message || error);
       }
     };
     fetchTechnicians();
@@ -194,7 +203,11 @@ const ServiceCenterDashboard = () => {
                             className="text-xs bg-white dark:bg-slate-800 border-slate-200 py-1.5"
                           >
                             <option value="" disabled>Select Tech</option>
-                            {technicians.map(t => <option key={t._id} value={t._id}>{t.name}</option>)}
+                            {technicians.map(t => (
+                              <option key={t._id || t.id} value={t._id || t.id}>
+                                {t.name || t.displayName || t.email}
+                              </option>
+                            ))}
                           </select>
                           <button
                             onClick={() => handleAssign(a)}
