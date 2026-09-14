@@ -6,6 +6,7 @@ import { createServiceRecord } from '../redux/slices/serviceRecordSlice';
 import { createInvoice, getInvoices } from '../redux/slices/invoiceSlice';
 import axiosInstance from '../services/axiosInstance';
 import { USERS_URL, SERVICES_URL, STATUS } from '../utils/constants';
+import { auth } from '../config/firebase';
 import Card from '../components/common/Card';
 import StatusBadge from '../components/common/StatusBadge';
 import Loader from '../components/common/Loader';
@@ -46,15 +47,23 @@ const ServiceCenterDashboard = () => {
     dispatch(getInvoices());
     fetchServiceRecords();
 
-    const fetchTechnicians = async () => {
+    // Wait for Firebase Auth to restore the session before fetching technicians.
+    // auth.currentUser is null on first render; onAuthStateChanged fires once
+    // the SDK has confirmed the user's session — guaranteeing a fresh token.
+    const unsubscribe = auth.onAuthStateChanged(async (user) => {
+      if (!user) return;
       try {
+        // Force-refresh the token so the backend never gets a stale one.
+        await user.getIdToken(true);
         const { data } = await axiosInstance.get(`${USERS_URL}/technicians`);
         setTechnicians(data);
       } catch (error) {
         console.error('Failed to fetch technicians:', error.response?.data || error.message);
+        toast.error('Could not load technician list. Please refresh.');
       }
-    };
-    fetchTechnicians();
+    });
+
+    return () => unsubscribe();
   }, [dispatch]);
 
   const handleSelectChange = (apptId, techId) => {
