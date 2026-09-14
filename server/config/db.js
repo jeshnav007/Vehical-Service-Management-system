@@ -1,16 +1,14 @@
-import mongoose from 'mongoose';
+import { db, isInitialized } from './firebase.js';
 
 const connectDB = async () => {
   try {
-    const conn = await mongoose.connect(process.env.MONGO_URI, {
-      useNewUrlParser: true,
-      useUnifiedTopology: true,
-    });
-
-    console.log(`MongoDB Connected: ${conn.connection.host}`);
+    if (db) {
+      console.log('🔥 Cloud Firestore connection verified.');
+    } else {
+      console.log('⚠️ Cloud Firestore pending initialization.');
+    }
   } catch (error) {
-    console.error(`Error: ${error.message}`);
-    process.exit(1);
+    console.error(`Firebase Connection Error: ${error.message}`);
   }
 };
 

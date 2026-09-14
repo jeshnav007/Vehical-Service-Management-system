@@ -1,0 +1,65 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper function: Check if user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Helper function: Check if user is the document owner
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Users collection: Users can only read and write their own profile
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow write: if isOwner(userId);
+    }
+
+    // Vehicles collection: Only vehicle owner can read/write
+    match /vehicles/{vehicleId} {
+      allow read: if isAuthenticated() && (resource == null || resource.data.user == request.auth.uid);
+      allow create: if isAuthenticated() && request.resource.data.user == request.auth.uid;
+      allow update, delete: if isAuthenticated() && resource.data.user == request.auth.uid;
+    }
+
+    // Appointments collection: Only appointment owner or staff can read
+    match /appointments/{appointmentId} {
+      allow read: if isAuthenticated() && (resource == null || resource.data.user == request.auth.uid);
+      allow create: if isAuthenticated() && request.resource.data.user == request.auth.uid;
+      allow update: if isAuthenticated() && (resource.data.user == request.auth.uid);
+      allow delete: if false; // Only backend admin SDK can delete
+    }
+
+    // Service Records collection: Managed strictly via backend Express API
+    match /serviceRecords/{recordId} {
+      allow read: if isAuthenticated();
+      allow write: if false; // Enforce all updates go through Express API business logic
+    }
+
+    // Invoices collection: Invoices viewable by user, creation/updates strictly via backend
+    match /invoices/{invoiceId} {
+      allow read: if isAuthenticated() && (resource == null || resource.data.user == request.auth.uid);
+      allow write: if false; // Invoices generated and marked paid only via backend API
+    }
+
+    // Notifications collection: Users can only access their own notifications
+    match /notifications/{notificationId} {
+      allow read, update: if isAuthenticated() && resource.data.user == request.auth.uid;
+      allow create, delete: if false;
+    }
+
+    // Technicians registry: Read only for authenticated users, write via backend API
+    match /technicians/{techId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
+
+    // Default deny all other collections
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

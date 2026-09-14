@@ -1,33 +1,58 @@
-import mongoose from 'mongoose';
 import dotenv from 'dotenv';
-import User from '../models/userModel.js';
-import connectDB from '../config/db.js';
+import { auth, db } from '../config/firebase.js';
 
 dotenv.config();
-connectDB();
 
 const seedAdmin = async () => {
-  try {
-    const adminExists = await User.findOne({ email: 'admin@vsm.com' });
+  const adminEmail = process.env.ADMIN_SEED_EMAIL || 'admin@vsm.com';
+  const adminPassword = process.env.ADMIN_SEED_PASSWORD || 'AdminPassword123!';
 
-    if (adminExists) {
-      console.log('Admin user already exists!');
-      process.exit();
+  console.log('--- Seeding System Administrator ---');
+  console.log(`Target Email: ${adminEmail}`);
+
+  try {
+    let uid;
+
+    // 1. Check or create in Firebase Auth
+    try {
+      const existingUser = await auth.getUserByEmail(adminEmail);
+      uid = existingUser.uid;
+      console.log(`Firebase Auth account exists for ${adminEmail} (UID: ${uid})`);
+    } catch (err) {
+      if (err.code === 'auth/user-not-found') {
+        const newUser = await auth.createUser({
+          email: adminEmail,
+          password: adminPassword,
+          displayName: 'System Admin',
+        });
+        uid = newUser.uid;
+        console.log(`Created new Firebase Auth user for ${adminEmail} (UID: ${uid})`);
+      } else {
+        throw err;
+      }
     }
 
-    const adminUser = await User.create({
-      name: 'System Admin',
-      email: 'admin@vsm.com',
-      password: 'AdminPassword123!',
-      role: 'Admin',
-      phone: '0000000000',
-      address: 'VSM Headquarters',
-    });
+    // 2. Set Admin role in Cloud Firestore
+    const userRef = db.collection('users').doc(uid);
+    await userRef.set(
+      {
+        name: 'System Admin',
+        email: adminEmail.toLowerCase(),
+        role: 'Admin',
+        phone: '0000000000',
+        address: 'VSM Headquarters',
+        isActive: true,
+        updatedAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
 
-    console.log(`Admin User Seeded Successfully: ${adminUser.email}`);
-    process.exit();
+    console.log(`✅ System Administrator role assigned in Cloud Firestore.`);
+    console.log(`Credentials: ${adminEmail} / ${adminPassword}`);
+    process.exit(0);
   } catch (error) {
-    console.error(`Error: ${error.message}`);
+    console.error(`❌ Admin Seeding Failed: ${error.message}`);
     process.exit(1);
   }
 };

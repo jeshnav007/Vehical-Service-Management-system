@@ -1,39 +1,49 @@
-import mongoose from 'mongoose';
 import dotenv from 'dotenv';
-import User from '../models/userModel.js';
-import connectDB from '../config/db.js';
-import { ROLES } from './roles.js';
+import { auth, db } from '../config/firebase.js';
 
 dotenv.config();
-connectDB();
 
-const seedStaffToServiceCenter = async () => {
+const seedServiceCenter = async () => {
+  const email = 'service@vsm.com';
+  const password = 'ServicePassword123!';
+
   try {
-    const result = await User.updateMany(
-      { role: 'Staff' },
-      { $set: { role: ROLES.SERVICE_CENTER } }
-    );
-    console.log(`Migration Complete: Converted ${result.modifiedCount} legacy Staff entries.`);
-
-    const userExists = await User.findOne({ email: 'service@vsm.com' });
-    if (!userExists) {
-      await User.create({
-        name: 'Master Service Center',
-        email: 'service@vsm.com',
-        password: 'ServicePassword123!',
-        phone: '111-222-3333',
-        role: ROLES.SERVICE_CENTER,
-      });
-      console.log('Fixed ServiceCenter Profile generated exclusively: service@vsm.com');
-    } else {
-      console.log('Central ServiceCenter instance already physically configured.');
+    let uid;
+    try {
+      const user = await auth.getUserByEmail(email);
+      uid = user.uid;
+      console.log(`Firebase Auth account already exists for ${email}`);
+    } catch (err) {
+      if (err.code === 'auth/user-not-found') {
+        const user = await auth.createUser({
+          email,
+          password,
+          displayName: 'Master Service Center',
+        });
+        uid = user.uid;
+        console.log(`Created Firebase Auth user: ${email}`);
+      } else {
+        throw err;
+      }
     }
 
-    process.exit();
+    await db.collection('users').doc(uid).set({
+      name: 'Master Service Center',
+      email: email.toLowerCase(),
+      phone: '111-222-3333',
+      role: 'ServiceCenter',
+      isActive: true,
+      address: 'Central VSM Workshop, Station 1',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    }, { merge: true });
+
+    console.log(`✅ ServiceCenter Profile configured: ${email}`);
+    process.exit(0);
   } catch (error) {
     console.error(`Error: ${error.message}`);
     process.exit(1);
   }
 };
 
-seedStaffToServiceCenter();
+seedServiceCenter();

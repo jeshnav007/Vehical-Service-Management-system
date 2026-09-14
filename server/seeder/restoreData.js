@@ -1,148 +1,215 @@
-import mongoose from 'mongoose';
 import dotenv from 'dotenv';
-import connectDB from '../config/db.js';
-import User from '../models/userModel.js';
-import Vehicle from '../models/vehicleModel.js';
-import Appointment from '../models/appointmentModel.js';
-import ServiceRecord from '../models/serviceRecordModel.js';
-import Invoice from '../models/invoiceModel.js';
-import Notification from '../models/notificationModel.js';
+import { auth, db } from '../config/firebase.js';
 
 dotenv.config();
 
 const restoreData = async () => {
   try {
-    await connectDB();
+    console.log('--- Starting Cloud Firestore & Firebase Auth Restoration ---');
 
-    console.log('--- Starting Backend Restoration ---');
+    // Helper to get or create Firebase user
+    const getOrCreateUser = async ({ email, password, displayName, role, phone, address }) => {
+      let uid;
+      try {
+        const existing = await auth.getUserByEmail(email);
+        uid = existing.uid;
+      } catch (err) {
+        if (err.code === 'auth/user-not-found') {
+          const created = await auth.createUser({
+            email,
+            password,
+            displayName,
+          });
+          uid = created.uid;
+          console.log(`Created Firebase Auth user: ${email}`);
+        } else {
+          throw err;
+        }
+      }
 
-    // 1. Ensure Required Users Exist
-    console.log('Verifying users...');
-    
-    let customer = await User.findOne({ role: 'Customer' });
-    if (!customer) {
-      customer = await User.create({
-        name: 'Default Customer',
-        email: 'customer@vsm.com',
-        password: 'CustomerPassword123!',
-        phone: '123-456-7890',
-        role: 'Customer',
-        address: '123 Main St, Tech City',
-      });
-      console.log('Created Default Customer: customer@vsm.com');
-    }
+      await db.collection('users').doc(uid).set(
+        {
+          name: displayName,
+          email: email.toLowerCase(),
+          phone: phone || '',
+          address: address || '',
+          role,
+          isActive: true,
+          updatedAt: new Date().toISOString(),
+          createdAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
 
-    let technician = await User.findOne({ role: 'Technician' });
-    if (!technician) {
-      technician = await User.create({
-        name: 'Default Technician',
-        email: 'tech@vsm.com',
-        password: 'TechPassword123!',
-        phone: '987-654-3210',
-        role: 'Technician',
-      });
-      console.log('Created Default Technician: tech@vsm.com');
-    }
+      return { uid, email, name: displayName, role };
+    };
 
-    let serviceCenter = await User.findOne({ role: 'ServiceCenter' });
-    if (!serviceCenter) {
-      serviceCenter = await User.create({
-        name: 'Default Service Center',
-        email: 'servicecenter@vsm.com',
-        password: 'ServiceCenterPassword123!',
-        phone: '555-010-9999',
-        role: 'ServiceCenter',
-      });
-      console.log('Created Default ServiceCenter: servicecenter@vsm.com');
-    }
+    // 1. Restore Core Users
+    console.log('1. Setting up users across all 4 roles...');
+    const customer = await getOrCreateUser({
+      email: 'customer@vsm.com',
+      password: 'CustomerPassword123!',
+      displayName: 'Default Customer',
+      role: 'Customer',
+      phone: '123-456-7890',
+      address: '123 Main St, Tech City',
+    });
 
-    // 2. Clear existing related data (optional, but requested "DO NOT duplicate records")
-    // Use checks before insert instead.
-    
-    // 3. Create Vehicle
-    let vehicle = await Vehicle.findOne({ user: customer._id });
-    if (!vehicle) {
-      vehicle = await Vehicle.create({
-        user: customer._id,
+    const technician = await getOrCreateUser({
+      email: 'tech@vsm.com',
+      password: 'TechPassword123!',
+      displayName: 'Default Technician',
+      role: 'Technician',
+      phone: '987-654-3210',
+    });
+
+    const serviceCenter = await getOrCreateUser({
+      email: 'servicecenter@vsm.com',
+      password: 'ServiceCenterPassword123!',
+      displayName: 'Default Service Center',
+      role: 'ServiceCenter',
+      phone: '555-010-9999',
+    });
+
+    const admin = await getOrCreateUser({
+      email: 'admin@vsm.com',
+      password: 'AdminPassword123!',
+      displayName: 'System Admin',
+      role: 'Admin',
+      phone: '000-000-0000',
+    });
+
+    // 2. Set up Technician profile
+    await db.collection('technicians').doc(technician.uid).set(
+      {
+        user: technician.uid,
+        employeeId: 'TECH-RESTORE-1',
+        specialization: ['Diagnostics', 'Engine', 'Transmission'],
+        availabilityStatus: 'Available',
+        rating: 5,
+        numReviews: 10,
+        updatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+
+    // 3. Create Sample Vehicle if not exists
+    console.log('2. Checking vehicles...');
+    let vehicleId;
+    const vSnap = await db.collection('vehicles').where('licensePlate', '==', 'VSM-RESTORE-1').limit(1).get();
+    if (vSnap.empty) {
+      const vRef = await db.collection('vehicles').add({
+        user: customer.uid,
         make: 'Toyota',
         model: 'Camry',
         year: 2022,
         licensePlate: 'VSM-RESTORE-1',
         vin: 'RESTOREVIN123456',
         mileage: 15000,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       });
-      console.log('Created Vehicle: Toyota Camry (VSM-RESTORE-1)');
+      vehicleId = vRef.id;
+      console.log(`Created Vehicle: Toyota Camry (ID: ${vehicleId})`);
+    } else {
+      vehicleId = vSnap.docs[0].id;
+      console.log(`Vehicle already exists (ID: ${vehicleId})`);
     }
 
-    // 4. Create Appointment
-    let appointment = await Appointment.findOne({ vehicle: vehicle._id, status: 'Approved' });
-    if (!appointment) {
-      appointment = await Appointment.create({
-        user: customer._id,
-        vehicle: vehicle._id,
-        date: new Date(),
+    // 4. Create Sample Appointment if not exists
+    console.log('3. Checking appointments...');
+    let appointmentId;
+    const aSnap = await db.collection('appointments').where('vehicle', '==', vehicleId).limit(1).get();
+    if (aSnap.empty) {
+      const aRef = await db.collection('appointments').add({
+        user: customer.uid,
+        vehicle: vehicleId,
+        date: new Date().toISOString(),
         time: '10:00 AM',
         serviceType: 'Maintenance',
         status: 'Approved',
         notes: 'Restoration seed appointment.',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       });
-      console.log('Created Appointment (Status: Approved)');
+      appointmentId = aRef.id;
+      console.log(`Created Appointment (ID: ${appointmentId})`);
+    } else {
+      appointmentId = aSnap.docs[0].id;
+      console.log(`Appointment already exists (ID: ${appointmentId})`);
     }
 
-    // 5. Create ServiceRecord
-    let serviceRecord = await ServiceRecord.findOne({ appointment: appointment._id });
-    if (!serviceRecord) {
-      serviceRecord = await ServiceRecord.create({
-        vehicle: vehicle._id,
-        appointment: appointment._id,
-        technician: technician._id,
+    // 5. Create Sample ServiceRecord if not exists
+    console.log('4. Checking service records...');
+    let serviceRecordId;
+    const sSnap = await db.collection('serviceRecords').where('appointment', '==', appointmentId).limit(1).get();
+    if (sSnap.empty) {
+      const sRef = await db.collection('serviceRecords').add({
+        vehicle: vehicleId,
+        appointment: appointmentId,
+        technician: technician.uid,
         serviceType: 'Maintenance',
         description: 'Initial restoration service record.',
         status: 'Completed',
+        invoiceGenerated: true,
+        isPaid: false,
         partsUsed: [
           { name: 'Oil Filter', quantity: 1, price: 15 },
           { name: 'Synthetic Oil', quantity: 5, price: 10 },
         ],
         laborHours: 1.5,
-        totalCost: 80, // (15+50) + (1.5 * default rate)
-        completedAt: new Date(),
+        totalCost: 215,
+        completedAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       });
-      console.log('Created ServiceRecord (Status: Completed)');
+      serviceRecordId = sRef.id;
+      console.log(`Created ServiceRecord (ID: ${serviceRecordId})`);
+    } else {
+      serviceRecordId = sSnap.docs[0].id;
+      console.log(`ServiceRecord already exists (ID: ${serviceRecordId})`);
     }
 
-    // 6. Create Invoice
-    let invoice = await Invoice.findOne({ serviceRecord: serviceRecord._id });
-    if (!invoice) {
-        // Calculate amount
-        const partsTotal = serviceRecord.partsUsed.reduce((acc, part) => acc + (part.price * part.quantity), 0);
-        const laborCost = serviceRecord.laborHours * 100; // Assuming 100/hr fixed rate
-        const amount = partsTotal + laborCost;
-        const tax = amount * 0.1;
-        const totalAmount = amount + tax;
+    // 6. Create Sample Invoice if not exists
+    console.log('5. Checking invoices...');
+    const iSnap = await db.collection('invoices').where('serviceRecord', '==', serviceRecordId).limit(1).get();
+    if (iSnap.empty) {
+      const partsTotal = 65; // (1*15) + (5*10)
+      const laborCost = 1.5 * 100; // 150
+      const amount = partsTotal + laborCost; // 215
+      const tax = amount * 0.10; // 21.5
+      const totalAmount = amount + tax; // 236.5
 
-      invoice = await Invoice.create({
-        user: customer._id,
-        vehicle: vehicle._id,
-        serviceRecord: serviceRecord._id,
+      const iRef = await db.collection('invoices').add({
+        user: customer.uid,
+        vehicle: vehicleId,
+        serviceRecord: serviceRecordId,
         amount,
         tax,
         totalAmount,
         paymentStatus: 'Pending',
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       });
-      console.log('Created Invoice (Payment Status: Pending)');
+      console.log(`Created Invoice (ID: ${iRef.id})`);
+    } else {
+      console.log('Invoice already exists.');
     }
 
     // 7. Create Notification
-    await Notification.create({
-      user: customer._id,
+    await db.collection('notifications').add({
+      user: customer.uid,
       title: 'Database Restored',
-      message: 'Your vehicle service data has been successfully restored.',
+      message: 'Your vehicle service data has been successfully initialized in Cloud Firestore.',
       type: 'Alert',
+      isRead: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     });
     console.log('Created Restoration Notification');
 
     console.log('--- Restoration Completed Successfully ---');
-    process.exit();
+    process.exit(0);
   } catch (error) {
     console.error(`Restoration Failed: ${error.message}`);
     process.exit(1);

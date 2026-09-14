@@ -1,20 +1,51 @@
 import asyncHandler from 'express-async-handler';
-import Invoice from '../models/invoiceModel.js';
-import ServiceRecord from '../models/serviceRecordModel.js';
-import User from '../models/userModel.js';
+import { db, docWithId, docsWithId } from '../config/firebase.js';
 import { createNotification } from './notificationController.js';
+
+// Helper to populate invoice vehicle, serviceRecord, and user
+const populateInvoice = async (invoice) => {
+  if (!invoice) return null;
+  const inv = { ...invoice };
+
+  if (inv.vehicle && typeof inv.vehicle === 'string') {
+    const vDoc = await db.collection('vehicles').doc(inv.vehicle).get();
+    if (vDoc.exists) {
+      inv.vehicle = docWithId(vDoc);
+    }
+  }
+
+  if (inv.serviceRecord && typeof inv.serviceRecord === 'string') {
+    const sDoc = await db.collection('serviceRecords').doc(inv.serviceRecord).get();
+    if (sDoc.exists) {
+      inv.serviceRecord = docWithId(sDoc);
+    }
+  }
+
+  if (inv.user && typeof inv.user === 'string') {
+    const uDoc = await db.collection('users').doc(inv.user).get();
+    if (uDoc.exists) {
+      const uData = uDoc.data();
+      inv.user = {
+        _id: uDoc.id,
+        id: uDoc.id,
+        name: uData.name || '',
+        email: uData.email || '',
+      };
+    }
+  }
+
+  return inv;
+};
 
 // @desc    Get all global invoices
 // @route   GET /api/invoices
 // @access  Private/ServiceCenter
 const getAllInvoices = asyncHandler(async (req, res) => {
-  const invoices = await Invoice.find({})
-    .populate('vehicle')
-    .populate('serviceRecord')
-    .populate('user', 'name');
-  
-  console.log(`📋 FETCHED ${invoices.length} INVOICES FOR SERVICE CENTER`);
-  res.status(200).json(invoices);
+  const snapshot = await db.collection('invoices').get();
+  const invoices = docsWithId(snapshot);
+  const populated = await Promise.all(invoices.map(populateInvoice));
+
+  res.status(200).json(populated);
 });
 
 // @desc    Create new invoice
@@ -23,32 +54,27 @@ const getAllInvoices = asyncHandler(async (req, res) => {
 const createInvoice = asyncHandler(async (req, res) => {
   const { serviceRecord } = req.body;
 
-  console.log(`🔷 CREATING INVOICE FOR SERVICE RECORD: ${serviceRecord}`);
-
   if (!serviceRecord) {
     res.status(400);
     throw new Error('serviceRecord ID is required');
   }
 
-  const record = await ServiceRecord.findById(serviceRecord)
-    .populate('vehicle')
-    .populate({ path: 'appointment', select: 'user' });
+  const recordRef = db.collection('serviceRecords').doc(serviceRecord);
+  const recordDoc = await recordRef.get();
 
-  if (!record) {
+  if (!recordDoc.exists) {
     res.status(404);
     throw new Error('Service Record not found');
   }
 
-  console.log(`   Service Record Status: ${record.status}`);
-  console.log(`   Expected Status: Completed`);
+  const record = recordDoc.data();
 
-  // ⭐ CRITICAL: Status enforcement
+  // Status enforcement
   if (record.status !== 'Completed') {
     res.status(400);
     throw new Error(`Cannot generate invoice. Service is not completed. Current status: "${record.status}"`);
   }
 
-  // ⭐ CRITICAL: Duplicate & Payment prevention
   if (record.invoiceGenerated) {
     res.status(400);
     throw new Error('Invoice already generated for this service.');
@@ -59,127 +85,163 @@ const createInvoice = asyncHandler(async (req, res) => {
     throw new Error('This service has already been paid for.');
   }
 
-  const existingInvoice = await Invoice.findOne({ serviceRecord: record._id });
-  if (existingInvoice) {
-    // Sync the flag if it was somehow missed but doc exists
-    record.invoiceGenerated = true;
-    await record.save();
+  // Duplicate check
+  const existingSnapshot = await db.collection('invoices')
+    .where('serviceRecord', '==', serviceRecord)
+    .limit(1)
+    .get();
+
+  if (!existingSnapshot.empty) {
+    await recordRef.update({ invoiceGenerated: true });
     res.status(400);
     throw new Error('Invoice already strictly exists in system registry.');
   }
 
-  // ✅ Calculate totals properly
+  // Calculate totals
   const partsTotal = record.partsUsed && record.partsUsed.length > 0
-    ? record.partsUsed.reduce((acc, part) => acc + (part.price * part.quantity), 0)
+    ? record.partsUsed.reduce((acc, part) => acc + ((part.price || 0) * (part.quantity || 1)), 0)
     : 0;
 
   const FIXED_RATE = 100; // $100/hr
   const laborCost = (record.laborHours || 0) * FIXED_RATE;
-  
   const amount = partsTotal + laborCost;
-  const tax = amount * 0.10; // 10% tax rate
+  const tax = amount * 0.10;
   const totalAmount = amount + tax;
 
-  console.log(`   Parts Total: $${partsTotal.toFixed(2)}`);
-  console.log(`   Labor Cost ($${FIXED_RATE}/hr × ${record.laborHours} hrs): $${laborCost.toFixed(2)}`);
-  console.log(`   Subtotal: $${amount.toFixed(2)}`);
-  console.log(`   Tax (10%): $${tax.toFixed(2)}`);
-  console.log(`   TOTAL: $${totalAmount.toFixed(2)}`);
+  // Find user (owner of vehicle or appointment)
+  let targetUser = null;
+  if (record.appointment) {
+    const aDoc = await db.collection('appointments').doc(record.appointment).get();
+    if (aDoc.exists) {
+      targetUser = aDoc.data().user;
+    }
+  }
 
-  const invoice = await Invoice.create({
-    user: record.appointment ? record.appointment.user : null,
-    vehicle: record.vehicle._id || record.vehicle,
-    serviceRecord: record._id,
+  if (!targetUser && record.vehicle) {
+    const vDoc = await db.collection('vehicles').doc(record.vehicle).get();
+    if (vDoc.exists) {
+      targetUser = vDoc.data().user;
+    }
+  }
+
+  const newInvoice = {
+    user: targetUser || null,
+    vehicle: record.vehicle || null,
+    serviceRecord: serviceRecord,
     amount,
     tax,
     totalAmount,
+    paymentStatus: 'Pending',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  const invoiceDocRef = await db.collection('invoices').add(newInvoice);
+
+  // Sync state back to ServiceRecord
+  await recordRef.update({
+    invoiceGenerated: true,
+    updatedAt: new Date().toISOString(),
   });
 
-  console.log(`✅ INVOICE CREATED: ${invoice._id}`);
-
-  // ⭐ Sync state back to ServiceRecord
-  record.invoiceGenerated = true;
-  await record.save();
-
-  if (invoice.user) {
+  if (targetUser) {
     await createNotification(
-      invoice.user,
+      targetUser,
       'Invoice Generated',
       `Your final invoice of $${totalAmount.toFixed(2)} is ready for payment.`,
       'Alert'
     );
   }
 
-  // Return fully populated invoice for frontend to use immediately
-  const populatedInvoice = await Invoice.findById(invoice._id)
-    .populate('vehicle', 'make model')
-    .populate('serviceRecord');
+  const createdDoc = await invoiceDocRef.get();
+  const populated = await populateInvoice(docWithId(createdDoc));
 
-  res.status(201).json(populatedInvoice);
+  res.status(201).json(populated);
 });
 
 // @desc    Get user invoices
 // @route   GET /api/invoices/myinvoices
 // @access  Private
 const getMyInvoices = asyncHandler(async (req, res) => {
-  const invoices = await Invoice.find({ user: req.user._id })
-    .populate('vehicle', 'make model')
-    .populate('serviceRecord');
-  
-  console.log(`📋 FETCHED ${invoices.length} INVOICES FOR USER ${req.user._id}`);
-  res.status(200).json(invoices);
+  const snapshot = await db.collection('invoices')
+    .where('user', '==', req.user._id)
+    .get();
+
+  const invoices = docsWithId(snapshot);
+  const populated = await Promise.all(invoices.map(populateInvoice));
+
+  res.status(200).json(populated);
 });
 
 // @desc    Mark invoice as paid
 // @route   PUT /api/invoices/:id/pay
 // @access  Private
 const markInvoiceAsPaid = asyncHandler(async (req, res) => {
-  const invoice = await Invoice.findById(req.params.id);
+  const invoiceRef = db.collection('invoices').doc(req.params.id);
+  const invoiceDoc = await invoiceRef.get();
 
-  if (invoice) {
-    if (invoice.paymentStatus === 'Paid') {
-      res.status(400);
-      throw new Error('Invoice is already marked as paid');
-    }
-
-    invoice.paymentStatus = 'Paid';
-    invoice.paymentDate = Date.now();
-
-    const updatedInvoice = await invoice.save();
-    
-    // ⭐ Sync state back to ServiceRecord
-    const record = await ServiceRecord.findById(invoice.serviceRecord);
-    if (record) {
-      record.isPaid = true;
-      await record.save();
-    }
-
-    // Notification Hook for CUSTOMER
-    await createNotification(
-      invoice.user,
-      'Payment Processed',
-      `Thank you! Payment for invoice #${invoice._id.toString().substring(0,6)} securely tracked.`,
-      'Info'
-    );
-
-    // Notification Hook for SERVICE CENTER (Staff)
-    const staff = await User.find({ role: 'ServiceCenter' });
-    await Promise.all(staff.map(member => 
-      createNotification(
-        member._id,
-        'Payment Received',
-        `Invoice #${invoice._id.toString().substring(0,6)} for ${invoice.vehicle?.make || 'Vehicle'} has been settled.`,
-        'Success'
-      )
-    ));
-
-    console.log(`💰 PAYMENT RECEIVED for Invoice ${invoice._id}`);
-
-    res.status(200).json(updatedInvoice);
-  } else {
+  if (!invoiceDoc.exists) {
     res.status(404);
     throw new Error('Invoice not found');
   }
+
+  const invoice = invoiceDoc.data();
+
+  if (invoice.paymentStatus === 'Paid') {
+    res.status(400);
+    throw new Error('Invoice is already marked as paid');
+  }
+
+  const updates = {
+    paymentStatus: 'Paid',
+    paymentDate: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  await invoiceRef.update(updates);
+
+  // Sync state to ServiceRecord
+  if (invoice.serviceRecord) {
+    const recordRef = db.collection('serviceRecords').doc(invoice.serviceRecord);
+    const recordDoc = await recordRef.get();
+    if (recordDoc.exists) {
+      await recordRef.update({
+        isPaid: true,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+  }
+
+  // Notification for customer
+  if (invoice.user) {
+    await createNotification(
+      invoice.user,
+      'Payment Processed',
+      `Thank you! Payment for invoice #${invoiceDoc.id.substring(0, 6)} securely tracked.`,
+      'Info'
+    );
+  }
+
+  // Notification for service center staff
+  try {
+    const staffSnapshot = await db.collection('users').where('role', '==', 'ServiceCenter').get();
+    const staffDocs = docsWithId(staffSnapshot);
+    await Promise.all(staffDocs.map(member =>
+      createNotification(
+        member._id,
+        'Payment Received',
+        `Invoice #${invoiceDoc.id.substring(0, 6)} has been settled.`,
+        'Info'
+      )
+    ));
+  } catch (err) {
+    console.error('Failed to notify staff of payment:', err.message);
+  }
+
+  const updatedDoc = await invoiceRef.get();
+  const populated = await populateInvoice(docWithId(updatedDoc));
+
+  res.status(200).json(populated);
 });
 
 export { createInvoice, getAllInvoices, getMyInvoices, markInvoiceAsPaid };

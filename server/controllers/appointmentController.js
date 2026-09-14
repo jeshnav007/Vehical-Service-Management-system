@@ -1,6 +1,37 @@
 import asyncHandler from 'express-async-handler';
-import Appointment from '../models/appointmentModel.js';
+import { db, docWithId, docsWithId } from '../config/firebase.js';
 import { createNotification } from './notificationController.js';
+
+// Helper to populate vehicle and user on appointment objects
+const populateAppointment = async (appointment) => {
+  if (!appointment) return null;
+  const appt = { ...appointment };
+
+  // Populate vehicle
+  if (appt.vehicle && typeof appt.vehicle === 'string') {
+    const vDoc = await db.collection('vehicles').doc(appt.vehicle).get();
+    if (vDoc.exists) {
+      appt.vehicle = docWithId(vDoc);
+    }
+  }
+
+  // Populate user
+  if (appt.user && typeof appt.user === 'string') {
+    const uDoc = await db.collection('users').doc(appt.user).get();
+    if (uDoc.exists) {
+      const uData = uDoc.data();
+      appt.user = {
+        _id: uDoc.id,
+        id: uDoc.id,
+        name: uData.name || '',
+        email: uData.email || '',
+        phone: uData.phone || '',
+      };
+    }
+  }
+
+  return appt;
+};
 
 // @desc    Book new appointment
 // @route   POST /api/appointments
@@ -8,63 +39,91 @@ import { createNotification } from './notificationController.js';
 const createAppointment = asyncHandler(async (req, res) => {
   const { vehicle, date, time, serviceType, notes } = req.body;
 
-  const appointment = await Appointment.create({
+  if (!vehicle || !date || !serviceType) {
+    res.status(400);
+    throw new Error('Please provide vehicle, date, and service type');
+  }
+
+  const newAppt = {
     user: req.user._id,
     vehicle,
-    date,
-    time,
+    date: date ? new Date(date).toISOString() : new Date().toISOString(),
+    time: time || '10:00 AM',
     serviceType,
-    notes,
-    status: 'Pending Approval', // Strictly Enforced
-  });
+    notes: notes || '',
+    status: 'Pending Approval',
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
 
-  res.status(201).json(appointment);
+  const docRef = await db.collection('appointments').add(newAppt);
+  const createdDoc = await docRef.get();
+
+  res.status(201).json(docWithId(createdDoc));
 });
 
 // @desc    Approve an appointment
 // @route   PUT /api/appointments/:id/approve
 // @access  Private/ServiceCenter
 const approveAppointment = asyncHandler(async (req, res) => {
-  const appointment = await Appointment.findById(req.params.id).populate('vehicle');
+  const apptRef = db.collection('appointments').doc(req.params.id);
+  const apptDoc = await apptRef.get();
 
-  if (!appointment) {
+  if (!apptDoc.exists) {
     res.status(404);
-    throw new Error('Appointment not found natively');
+    throw new Error('Appointment not found');
   }
 
-  // VALIDATION: Only Pending Approval can be approved
-  if (appointment.status !== 'Pending Approval') {
+  const apptData = apptDoc.data();
+
+  if (apptData.status !== 'Pending Approval') {
     res.status(400);
-    throw new Error(`Cannot approve appointment in '${appointment.status}' state`);
+    throw new Error(`Cannot approve appointment in '${apptData.status}' state`);
   }
 
-  appointment.status = 'Approved';
-  await appointment.save();
+  const updates = {
+    status: 'Approved',
+    updatedAt: new Date().toISOString(),
+  };
+
+  await apptRef.update(updates);
 
   await createNotification(
-    appointment.user,
+    apptData.user,
     'Appointment Approved',
-    `Your upcoming ${appointment.serviceType} service request has been formalized and approved.`,
+    `Your upcoming ${apptData.serviceType} service request has been formalized and approved.`,
     'Info'
   );
 
-  res.status(200).json(appointment);
+  const updatedDoc = await apptRef.get();
+  const populated = await populateAppointment(docWithId(updatedDoc));
+
+  res.status(200).json(populated);
 });
 
 // @desc    Get logged in user's appointments
 // @route   GET /api/appointments/myappointments
 // @access  Private
 const getMyAppointments = asyncHandler(async (req, res) => {
-  const appointments = await Appointment.find({ user: req.user._id }).populate('vehicle', 'make model licensePlate');
-  res.status(200).json(appointments);
+  const snapshot = await db.collection('appointments')
+    .where('user', '==', req.user._id)
+    .get();
+
+  const appointments = docsWithId(snapshot);
+  const populated = await Promise.all(appointments.map(populateAppointment));
+
+  res.status(200).json(populated);
 });
 
 // @desc    Get all appointments (Admin/Staff)
 // @route   GET /api/appointments
 // @access  Private/Admin
 const getAppointments = asyncHandler(async (req, res) => {
-  const appointments = await Appointment.find({}).populate('user', 'name email').populate('vehicle', 'make model');
-  res.status(200).json(appointments);
+  const snapshot = await db.collection('appointments').get();
+  const appointments = docsWithId(snapshot);
+  const populated = await Promise.all(appointments.map(populateAppointment));
+
+  res.status(200).json(populated);
 });
 
 // @desc    Reject an appointment
@@ -72,33 +131,40 @@ const getAppointments = asyncHandler(async (req, res) => {
 // @access  Private/ServiceCenter
 const rejectAppointment = asyncHandler(async (req, res) => {
   const { rejectionReason } = req.body;
-  const appointment = await Appointment.findById(req.params.id);
+  const apptRef = db.collection('appointments').doc(req.params.id);
+  const apptDoc = await apptRef.get();
 
-  if (!appointment) {
+  if (!apptDoc.exists) {
     res.status(404);
     throw new Error('Appointment not found');
   }
 
-  // VALIDATION: Cannot reject after technician is assigned
+  const apptData = apptDoc.data();
+
   const allowedForRejection = ['Pending Approval', 'Approved'];
-  if (!allowedForRejection.includes(appointment.status)) {
+  if (!allowedForRejection.includes(apptData.status)) {
     res.status(400);
-    throw new Error(`Rejection blocked: Appointment is already in '${appointment.status}' state`);
+    throw new Error(`Rejection blocked: Appointment is already in '${apptData.status}' state`);
   }
 
-  appointment.status = 'Rejected';
-  appointment.rejectionReason = rejectionReason || 'No reason provided';
-  appointment.rejectedAt = new Date();
-  await appointment.save();
+  const updates = {
+    status: 'Rejected',
+    rejectionReason: rejectionReason || 'No reason provided',
+    rejectedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  await apptRef.update(updates);
 
   await createNotification(
-    appointment.user,
+    apptData.user,
     'Appointment Rejected',
-    `Your service request for ${appointment.serviceType} has been rejected. Reason: ${appointment.rejectionReason}`,
+    `Your service request for ${apptData.serviceType} has been rejected. Reason: ${updates.rejectionReason}`,
     'Alert'
   );
 
-  res.status(200).json(appointment);
+  const updatedDoc = await apptRef.get();
+  res.status(200).json(docWithId(updatedDoc));
 });
 
 // @desc    Cancel an appointment
@@ -106,42 +172,44 @@ const rejectAppointment = asyncHandler(async (req, res) => {
 // @access  Private
 const cancelAppointment = asyncHandler(async (req, res) => {
   const { cancellationReason } = req.body;
-  const appointment = await Appointment.findById(req.params.id);
+  const apptRef = db.collection('appointments').doc(req.params.id);
+  const apptDoc = await apptRef.get();
 
-  if (!appointment) {
+  if (!apptDoc.exists) {
     res.status(404);
     throw new Error('Appointment not found');
   }
 
-  // SECURITY: Only creator can cancel
-  if (appointment.user.toString() !== req.user._id.toString()) {
+  const apptData = apptDoc.data();
+
+  if (apptData.user.toString() !== req.user._id.toString()) {
     res.status(401);
     throw new Error('User not authorized to cancel this appointment');
   }
 
-  // VALIDATION: Terminal state lock & restricted states
-  // User can cancel until before the technician starts the repair
   const allowedStatuses = ['Pending Approval', 'Approved', 'Technician Assigned'];
-  if (!allowedStatuses.includes(appointment.status)) {
+  if (!allowedStatuses.includes(apptData.status)) {
     res.status(400);
-    throw new Error(`Cancellation blocked: Repair has already started or appointment is in '${appointment.status}' status.`);
+    throw new Error(`Cancellation blocked: Repair has already started or appointment is in '${apptData.status}' status.`);
   }
 
-  appointment.status = 'Cancelled';
-  appointment.cancellationReason = cancellationReason || 'Cancelled by customer';
-  appointment.cancelledAt = new Date();
-  await appointment.save();
+  const updates = {
+    status: 'Cancelled',
+    cancellationReason: cancellationReason || 'Cancelled by customer',
+    cancelledAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
 
-  // Notify Service Center (Admin/Staff)
-  // We'll notify the first ServiceCenter user found to maintain model integrity
+  await apptRef.update(updates);
+
+  // Notify Service Center staff
   try {
-    const User = (await import('../models/userModel.js')).default;
-    const staff = await User.findOne({ role: 'ServiceCenter' });
-    if (staff) {
+    const staffSnapshot = await db.collection('users').where('role', '==', 'ServiceCenter').limit(1).get();
+    if (!staffSnapshot.empty) {
       await createNotification(
-        staff._id,
+        staffSnapshot.docs[0].id,
         'Appointment Cancelled',
-        `Customer cancelled appointment #${appointment._id.toString().slice(-6)}`,
+        `Customer cancelled appointment #${apptDoc.id.slice(-6)}`,
         'Alert'
       );
     }
@@ -149,7 +217,15 @@ const cancelAppointment = asyncHandler(async (req, res) => {
     console.error('Failed to notify staff:', err.message);
   }
 
-  res.status(200).json(appointment);
+  const updatedDoc = await apptRef.get();
+  res.status(200).json(docWithId(updatedDoc));
 });
 
-export { createAppointment, approveAppointment, getMyAppointments, getAppointments, rejectAppointment, cancelAppointment };
+export {
+  createAppointment,
+  approveAppointment,
+  getMyAppointments,
+  getAppointments,
+  rejectAppointment,
+  cancelAppointment,
+};

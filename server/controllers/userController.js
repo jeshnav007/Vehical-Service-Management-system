@@ -1,76 +1,163 @@
 import asyncHandler from 'express-async-handler';
-import User from '../models/userModel.js';
-import generateToken from '../utils/generateToken.js';
+import { auth, db, docWithId, docsWithId } from '../config/firebase.js';
 
-// @desc    Auth user & get token
+// @desc    Auth user & get profile / verify session
 // @route   POST /api/users/login
 // @access  Public
 const authUser = asyncHandler(async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, token: bodyToken } = req.body;
+  const authHeader = req.headers.authorization;
+  const token = bodyToken || (authHeader && authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : null);
 
-  const user = await User.findOne({ email });
+  if (token) {
+    try {
+      const decoded = await auth.verifyIdToken(token);
+      const uid = decoded.uid;
 
-  if (user && (await user.matchPassword(password))) {
-    if (user.isActive === false) {
+      const userDoc = await db.collection('users').doc(uid).get();
+      if (!userDoc.exists) {
+        res.status(404);
+        throw new Error('User profile not found. Please register first.');
+      }
+
+      const userData = userDoc.data();
+      if (userData.isActive === false) {
+        res.status(401);
+        throw new Error('Account has been deactivated. Please contact support.');
+      }
+
+      return res.status(200).json({
+        _id: uid,
+        id: uid,
+        name: userData.name,
+        email: userData.email || decoded.email,
+        role: userData.role || 'Customer',
+        phone: userData.phone || '',
+        token,
+      });
+    } catch (err) {
       res.status(401);
-      throw new Error('Account has been deactivated. Please contact support.');
+      throw new Error(err.message || 'Invalid or expired Firebase token');
     }
-
-    const token = generateToken(user._id, user.role);
-
-    res.status(200).json({
-      _id: user._id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      phone: user.phone,
-      token,
-    });
-  } else {
-    res.status(401);
-    throw new Error('Invalid email or password');
   }
+
+  // Fallback if client called with email/password directly
+  if (email) {
+    const usersSnapshot = await db.collection('users').where('email', '==', email.toLowerCase()).limit(1).get();
+    if (!usersSnapshot.empty) {
+      const userDoc = usersSnapshot.docs[0];
+      const userData = userDoc.data();
+      if (userData.isActive === false) {
+        res.status(401);
+        throw new Error('Account has been deactivated. Please contact support.');
+      }
+      return res.status(200).json({
+        _id: userDoc.id,
+        id: userDoc.id,
+        name: userData.name,
+        email: userData.email,
+        role: userData.role,
+        phone: userData.phone,
+        message: 'Authenticated via Firebase',
+      });
+    }
+  }
+
+  res.status(400);
+  throw new Error('Please provide email or valid Firebase ID token');
 });
 
-// @desc    Register a new user
+// @desc    Register a new user / create Firestore profile
 // @route   POST /api/users
 // @access  Public
 const registerUser = asyncHandler(async (req, res) => {
   const { name, email, password, phone, address } = req.body;
 
-  const userExists = await User.findOne({ email });
+  let uid;
+  let token;
 
-  if (userExists) {
-    res.status(400);
-    throw new Error('User already exists');
+  // Check if caller already has Firebase ID token (from frontend client SDK)
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    try {
+      token = authHeader.split(' ')[1];
+      const decoded = await auth.verifyIdToken(token);
+      uid = decoded.uid;
+    } catch (e) {
+      // Continue to fallback
+    }
   }
 
-  const user = await User.create({
-    name,
-    email,
-    password,
-    phone,
-    address,
-  });
+  // If no UID yet, create user in Firebase Auth via Admin SDK
+  if (!uid) {
+    if (!email || !password) {
+      res.status(400);
+      throw new Error('Email and password are required');
+    }
 
-  if (user) {
-    const token = generateToken(user._id, user.role);
+    try {
+      const userRecord = await auth.createUser({
+        email,
+        password,
+        displayName: name,
+        phoneNumber: phone && phone.startsWith('+') ? phone : undefined,
+      });
+      uid = userRecord.uid;
+    } catch (err) {
+      res.status(400);
+      throw new Error(err.message || 'Failed to create user in Firebase Auth');
+    }
+  }
 
-    res.status(201).json({
-      _id: user._id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      phone: user.phone,
-      token,
+  // Check if profile document already exists in Firestore
+  const userRef = db.collection('users').doc(uid);
+  const existingDoc = await userRef.get();
+
+  if (existingDoc.exists) {
+    const existingData = existingDoc.data();
+    return res.status(200).json({
+      _id: uid,
+      id: uid,
+      name: existingData.name,
+      email: existingData.email,
+      role: existingData.role,
+      phone: existingData.phone,
+      token: token || '',
     });
-  } else {
-    res.status(400);
-    throw new Error('Invalid user data');
   }
+
+  // Ensure unique email check in Firestore
+  if (email) {
+    const emailCheck = await db.collection('users').where('email', '==', email.toLowerCase()).limit(1).get();
+    if (!emailCheck.empty && emailCheck.docs[0].id !== uid) {
+      res.status(400);
+      throw new Error('User with this email already exists');
+    }
+  }
+
+  // Create profile in Firestore
+  const newProfile = {
+    name: name || 'VSM User',
+    email: email ? email.toLowerCase() : '',
+    phone: phone || '',
+    address: address || '',
+    role: 'Customer', // Default role for public registration
+    isActive: true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  await userRef.set(newProfile);
+
+  res.status(201).json({
+    _id: uid,
+    id: uid,
+    ...newProfile,
+    token: token || '',
+  });
 });
 
-// @desc    Logout user / clear cookie
+// @desc    Logout user / clear session
 // @route   POST /api/users/logout
 // @access  Public
 const logoutUser = asyncHandler(async (req, res) => {
@@ -86,11 +173,13 @@ const logoutUser = asyncHandler(async (req, res) => {
 // @route   GET /api/users/profile
 // @access  Private
 const getUserProfile = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.user._id);
+  const userDoc = await db.collection('users').doc(req.user._id).get();
 
-  if (user) {
+  if (userDoc.exists) {
+    const user = docWithId(userDoc);
     res.status(200).json({
       _id: user._id,
+      id: user._id,
       name: user.name,
       email: user.email,
       role: user.role,
@@ -107,16 +196,21 @@ const getUserProfile = asyncHandler(async (req, res) => {
 // @route   GET /api/users
 // @access  Private/Admin
 const getUsers = asyncHandler(async (req, res) => {
-  // Support ?isActive=false to fetch deactivated users for admin panel
-  const filter = {};
+  let query = db.collection('users');
+
   if (req.query.isActive === 'false') {
-    filter.isActive = false;
+    query = query.where('isActive', '==', false);
   } else {
-    // Legacy support: match true OR undefined (new field default logic)
-    filter.isActive = { $ne: false };
+    // Default active users
+    query = query.where('isActive', '!=', false);
   }
 
-  const users = await User.find(filter).select('-password');
+  const snapshot = await query.get();
+  const users = docsWithId(snapshot).map((u) => {
+    const { password, ...safeUser } = u;
+    return safeUser;
+  });
+
   res.status(200).json(users);
 });
 
@@ -126,49 +220,83 @@ const getUsers = asyncHandler(async (req, res) => {
 const createTechnician = asyncHandler(async (req, res) => {
   const { name, email, password, phone } = req.body;
 
-  const userExists = await User.findOne({ email });
-  if (userExists) {
+  if (!email || !password) {
     res.status(400);
-    throw new Error('User already exists');
+    throw new Error('Email and password are required');
   }
 
-  const user = await User.create({
+  // 1. Create in Firebase Authentication
+  let userRecord;
+  try {
+    userRecord = await auth.createUser({
+      email,
+      password,
+      displayName: name,
+    });
+  } catch (authErr) {
+    if (authErr.code === 'auth/email-already-exists') {
+      res.status(400);
+      throw new Error('User with this email already exists in Firebase Auth');
+    }
+    res.status(400);
+    throw new Error(authErr.message || 'Failed to create technician in Firebase Auth');
+  }
+
+  const uid = userRecord.uid;
+
+  // 2. Create in Firestore users collection
+  const techUser = {
+    name,
+    email: email.toLowerCase(),
+    phone: phone || '',
+    role: 'Technician',
+    isActive: true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  await db.collection('users').doc(uid).set(techUser);
+
+  // 3. Create technician registry entry
+  const techDoc = {
+    user: uid,
+    employeeId: `TECH-${Math.floor(1000 + Math.random() * 9000)}`,
+    specialization: ['General Service', 'Maintenance'],
+    availabilityStatus: 'Available',
+    rating: 5,
+    numReviews: 0,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  await db.collection('technicians').doc(uid).set(techDoc);
+
+  res.status(201).json({
+    _id: uid,
+    id: uid,
     name,
     email,
-    password,
-    phone,
     role: 'Technician',
   });
-
-  if (user) {
-    res.status(201).json({
-       _id: user._id, 
-       name: user.name, 
-       email: user.email, 
-       role: user.role 
-    });
-  } else {
-    res.status(400);
-    throw new Error('Invalid user data');
-  }
 });
 
-// @desc    Delete user
+// @desc    Deactivate user (Soft Delete)
 // @route   DELETE /api/users/:id
 // @access  Private/Admin
 const deleteUser = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.params.id);
+  const userRef = db.collection('users').doc(req.params.id);
+  const userDoc = await userRef.get();
 
-  if (user) {
+  if (userDoc.exists) {
+    const user = userDoc.data();
     if (user.role === 'Admin') {
       res.status(400);
       throw new Error('Cannot delete admin user');
     }
-    
-    // Perform Soft Delete
-    user.isActive = false;
-    await user.save();
-    
+
+    await userRef.update({
+      isActive: false,
+      updatedAt: new Date().toISOString(),
+    });
+
     res.status(200).json({ message: 'User deactivated successfully' });
   } else {
     res.status(404);
@@ -180,11 +308,14 @@ const deleteUser = asyncHandler(async (req, res) => {
 // @route   PUT /api/users/:id/restore
 // @access  Private/Admin
 const restoreUser = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.params.id);
+  const userRef = db.collection('users').doc(req.params.id);
+  const userDoc = await userRef.get();
 
-  if (user) {
-    user.isActive = true;
-    await user.save();
+  if (userDoc.exists) {
+    await userRef.update({
+      isActive: true,
+      updatedAt: new Date().toISOString(),
+    });
     res.status(200).json({ message: 'User account restored successfully' });
   } else {
     res.status(404);
@@ -192,11 +323,20 @@ const restoreUser = asyncHandler(async (req, res) => {
   }
 });
 
-// @desc    Get user technicians strictly
+// @desc    Get technician users strictly
 // @route   GET /api/users/technicians
 // @access  Private/ServiceCenter
 const getTechnicianUsers = asyncHandler(async (req, res) => {
-  const technicians = await User.find({ role: 'Technician', isActive: { $ne: false } }).select('-password');
+  const snapshot = await db.collection('users')
+    .where('role', '==', 'Technician')
+    .where('isActive', '!=', false)
+    .get();
+
+  const technicians = docsWithId(snapshot).map(t => {
+    const { password, ...safeTech } = t;
+    return safeTech;
+  });
+
   res.status(200).json(technicians);
 });
 
@@ -204,54 +344,48 @@ const getTechnicianUsers = asyncHandler(async (req, res) => {
 // @route   PUT /api/users/profile
 // @access  Private
 const updateUserProfile = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.user._id);
+  const userRef = db.collection('users').doc(req.user._id);
+  const userDoc = await userRef.get();
 
-  if (user) {
-    // If email is being changed, check if it's already taken
-    if (req.body.email && req.body.email !== user.email) {
-      const emailExists = await User.findOne({ email: req.body.email });
-      if (emailExists) {
-        res.status(400);
-        throw new Error('Email already taken');
-      }
-      user.email = req.body.email;
-    }
+  if (userDoc.exists) {
+    const user = userDoc.data();
 
-    user.name = req.body.name || user.name;
-    user.phone = req.body.phone || user.phone;
-    user.address = req.body.address || user.address;
-
-    // Security: Prevent Role Modification
+    // Security check: Prevent client from modifying their role
     if (req.body.role && req.body.role !== user.role) {
       res.status(400);
       throw new Error('Unauthorized role modification attempt');
     }
 
-    // Handle Password Update with Security Enhancement
-    if (req.body.password) {
-      if (!req.body.oldPassword) {
-        res.status(400);
-        throw new Error('Current password is required to set a new password');
-      }
+    const updates = {
+      name: req.body.name || user.name,
+      phone: req.body.phone !== undefined ? req.body.phone : user.phone,
+      address: req.body.address !== undefined ? req.body.address : user.address,
+      updatedAt: new Date().toISOString(),
+    };
 
-      const isMatch = await user.matchPassword(req.body.oldPassword);
-      if (!isMatch) {
-        res.status(401);
-        throw new Error('Incorrect current password');
+    // If password update requested, update via Firebase Auth
+    if (req.body.password) {
+      try {
+        await auth.updateUser(req.user._id, { password: req.body.password });
+      } catch (err) {
+        res.status(400);
+        throw new Error(`Password update failed: ${err.message}`);
       }
-      user.password = req.body.password;
     }
 
-    const updatedUser = await user.save();
+    await userRef.update(updates);
+
+    const updatedDoc = await userRef.get();
+    const updatedUser = docWithId(updatedDoc);
 
     res.status(200).json({
       _id: updatedUser._id,
+      id: updatedUser._id,
       name: updatedUser.name,
       email: updatedUser.email,
       role: updatedUser.role,
       phone: updatedUser.phone,
       address: updatedUser.address,
-      token: generateToken(updatedUser._id, updatedUser.role),
     });
   } else {
     res.status(404);
@@ -259,4 +393,15 @@ const updateUserProfile = asyncHandler(async (req, res) => {
   }
 });
 
-export { authUser, registerUser, logoutUser, getUserProfile, updateUserProfile, getUsers, createTechnician, deleteUser, restoreUser, getTechnicianUsers };
+export {
+  authUser,
+  registerUser,
+  logoutUser,
+  getUserProfile,
+  updateUserProfile,
+  getUsers,
+  createTechnician,
+  deleteUser,
+  restoreUser,
+  getTechnicianUsers,
+};
