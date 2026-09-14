@@ -6,7 +6,8 @@ import { createServiceRecord } from '../redux/slices/serviceRecordSlice';
 import { createInvoice, getInvoices } from '../redux/slices/invoiceSlice';
 import axiosInstance from '../services/axiosInstance';
 import { USERS_URL, SERVICES_URL, STATUS } from '../utils/constants';
-import { auth } from '../config/firebase';
+import { auth, db } from '../config/firebase';
+import { collection, getDocs, query, where } from 'firebase/firestore';
 import Card from '../components/common/Card';
 import StatusBadge from '../components/common/StatusBadge';
 import Loader from '../components/common/Loader';
@@ -47,23 +48,25 @@ const ServiceCenterDashboard = () => {
     dispatch(getInvoices());
     fetchServiceRecords();
 
-    // Wait for Firebase Auth to restore the session before fetching technicians.
-    // auth.currentUser is null on first render; onAuthStateChanged fires once
-    // the SDK has confirmed the user's session — guaranteeing a fresh token.
-    const unsubscribe = auth.onAuthStateChanged(async (user) => {
-      if (!user) return;
+    // Fetch technicians directly from Firestore client SDK.
+    // This bypasses the backend entirely, avoiding token/role issues on deployed envs.
+    const fetchTechnicians = async () => {
       try {
-        // Force-refresh the token so the backend never gets a stale one.
-        await user.getIdToken(true);
-        const { data } = await axiosInstance.get(`${USERS_URL}/technicians`);
-        setTechnicians(data);
+        const q = query(
+          collection(db, 'users'),
+          where('role', '==', 'Technician')
+        );
+        const snapshot = await getDocs(q);
+        const techs = snapshot.docs
+          .map(doc => ({ _id: doc.id, id: doc.id, ...doc.data() }))
+          .filter(t => t.isActive !== false); // exclude deactivated techs
+        setTechnicians(techs);
       } catch (error) {
-        console.error('Failed to fetch technicians:', error.response?.data || error.message);
+        console.error('Failed to fetch technicians from Firestore:', error.message);
         toast.error('Could not load technician list. Please refresh.');
       }
-    });
-
-    return () => unsubscribe();
+    };
+    fetchTechnicians();
   }, [dispatch]);
 
   const handleSelectChange = (apptId, techId) => {
