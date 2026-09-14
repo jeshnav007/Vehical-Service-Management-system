@@ -37,12 +37,10 @@ const getTechnicians = asyncHandler(async (req, res) => {
   }
 
   // Fallback: fetch users directly with role 'Technician'
-  const userSnapshot = await db.collection('users')
-    .where('role', '==', 'Technician')
-    .get();
+  const userSnapshot = await db.collection('users').get();
 
   const userTechs = docsWithId(userSnapshot)
-    .filter(u => u.isActive !== false)
+    .filter(u => u.isActive !== false && u.role && u.role.toLowerCase() === 'technician')
     .map(u => ({
       _id: u._id,
       id: u._id,
