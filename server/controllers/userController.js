@@ -329,13 +329,14 @@ const restoreUser = asyncHandler(async (req, res) => {
 const getTechnicianUsers = asyncHandler(async (req, res) => {
   const snapshot = await db.collection('users')
     .where('role', '==', 'Technician')
-    .where('isActive', '!=', false)
     .get();
 
-  const technicians = docsWithId(snapshot).map(t => {
-    const { password, ...safeTech } = t;
-    return safeTech;
-  });
+  const technicians = docsWithId(snapshot)
+    .filter(t => t.isActive !== false) // Handle missing or true
+    .map(t => {
+      const { password, ...safeTech } = t;
+      return safeTech;
+    });
 
   res.status(200).json(technicians);
 });

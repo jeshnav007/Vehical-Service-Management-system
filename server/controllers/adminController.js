@@ -19,25 +19,27 @@ const batchDeleteQuery = async (query) => {
 const getAdminStats = asyncHandler(async (req, res) => {
   try {
     const [
-      activeUsersSnap,
-      lifetimeUsersSnap,
+      allUsersSnap,
       vehiclesSnap,
-      activeApptsSnap,
+      allApptsSnap,
       completedServicesSnap,
       allServicesSnap,
     ] = await Promise.all([
-      db.collection('users').where('isActive', '!=', false).get(),
       db.collection('users').get(),
       db.collection('vehicles').get(),
-      db.collection('appointments').where('status', '!=', 'Cancelled').get(),
+      db.collection('appointments').get(),
       db.collection('serviceRecords').where('status', '==', 'Completed').get(),
       db.collection('serviceRecords').get(),
     ]);
 
-    const activeUsers = activeUsersSnap.size;
-    const lifetimeUsers = lifetimeUsersSnap.size;
+    const allUsers = allUsersSnap.docs.map(doc => doc.data());
+    const activeUsers = allUsers.filter(u => u.isActive !== false).length;
+    const lifetimeUsers = allUsersSnap.size;
     const activeVehicles = vehiclesSnap.size;
-    const activeAppointments = activeApptsSnap.size;
+    
+    const allAppts = allApptsSnap.docs.map(doc => doc.data());
+    const activeAppointments = allAppts.filter(a => a.status !== 'Cancelled').length;
+    
     const completedServices = completedServicesSnap.size;
     const pendingServices = Math.max(0, allServicesSnap.size - completedServices);
 

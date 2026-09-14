@@ -39,24 +39,25 @@ const getTechnicians = asyncHandler(async (req, res) => {
   // Fallback: fetch users directly with role 'Technician'
   const userSnapshot = await db.collection('users')
     .where('role', '==', 'Technician')
-    .where('isActive', '!=', false)
     .get();
 
-  const userTechs = docsWithId(userSnapshot).map(u => ({
-    _id: u._id,
-    id: u._id,
-    user: {
+  const userTechs = docsWithId(userSnapshot)
+    .filter(u => u.isActive !== false)
+    .map(u => ({
       _id: u._id,
       id: u._id,
-      name: u.name,
-      email: u.email,
-      phone: u.phone,
-    },
-    specialization: ['General Service'],
-    availabilityStatus: 'Available',
-    rating: 5,
-    numReviews: 0,
-  }));
+      user: {
+        _id: u._id,
+        id: u._id,
+        name: u.name,
+        email: u.email,
+        phone: u.phone,
+      },
+      specialization: ['General Service'],
+      availabilityStatus: 'Available',
+      rating: 5,
+      numReviews: 0,
+    }));
 
   res.status(200).json(userTechs);
 });
